@@ -21,6 +21,46 @@ Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le pr
 
 ---
 
+## [1.1.3] — 2026-05-09
+
+### ✨ Ajouté
+
+- **Logo Titalium personnalisé** en haut de l'app — l'image est injectée en base64 à la compilation par `Build-Exe.ps1` (le PNG source n'est pas versionné, fallback sur le « T » stylisé en exécution directe du `.ps1`)
+- **Bouton « ✓ Tout »** sur tous les DataGrids avec checkboxes (Logiciels Winget, Logiciels installés, Bloatware, Pilotes, Démarrage, Services, Processus) — toggle smart : si tout coché → décoche tout, sinon coche tout
+- **Mécanisme anti-orphelin de processus** : Job Object Windows avec `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Tous les processus enfants (sfc, dism, net, winmgmt…) sont automatiquement tués par Windows si le parent meurt. Plus aucun zombie possible.
+- **Force-exit en `finally`** après `ShowDialog()` via `[Environment]::Exit(0)` — termine tous les threads (foreground + background). Plus de processus invisible (sans fenêtre) qui survit après un crash en init.
+
+### 🐛 Corrigé
+
+- **`Run-Process` ipconfig/ping bloquait** : `StreamReader.EndOfStream` lisait à l'avance et bloquait. Détection EOF désormais via `ReadLineAsync().Result == null`.
+- **WMI verify crashait** : ajout de pré-checks PowerShell (`Get-Service Winmgmt` + requête CIM) + try/catch outer. Plus de crash sur sortie process trop rapide.
+- **Catroot2 / SoftwareDistribution** : try/catch outer + redémarrage forcé des services dans le finally même en cas d'erreur (sinon Windows Update reste cassé).
+- **SFC plantait** sous charge de sortie : refactor de `Run-Process` pour utiliser `StreamReader.ReadLineAsync` + `Task.WaitAny(100ms)` au lieu de `DataReceivedEventHandler` (les scriptblocks PS comme handlers .NET souffrent de runspace contention sous charge).
+- **Pilotes — bouton d'aide MAJ** : ne ouvre plus un navigateur Google. Copie désormais les infos des pilotes sélectionnés dans le presse-papier et ouvre la page Windows native `ms-settings:windowsupdate-optionalupdates` (où Microsoft expose les drivers de son catalogue).
+- **Inventaire pilotes lent** : `pnputil /enum-drivers` remplacé par `Get-CimInstance Win32_PnPSignedDriver` (~10× plus rapide), trié par date avec libellés visuels (`⚠ très ancien`, `⚠ ancien`).
+
+### 🔧 Modifié
+
+- **Tous les `Op-Info*`** (CPU, RAM, GPU, Disques, SMART, Uptime, Réseau) convertis en DataGrid Section/Propriété/Valeur — plus aucune sortie console pour les infos système.
+- **`Build-Exe.ps1`** lit `logo.png` (gitignored) et l'injecte en base64 dans une copie temporaire du `.ps1` avant compilation. La copie temporaire est supprimée après compilation.
+
+---
+
+## [1.1.2] — 2026-05-09 (jamais releasé publiquement, fusionné dans 1.1.3)
+
+### 🐛 Corrigé
+
+- **Annulation d'opération bloquante** : `Run-Process` lisait stdout en mode synchrone caractère par caractère ; quand un processus enfant ne répondait plus (typiquement `net stop cryptsvc` quand le service Cryptographic Services est en train de stopper), le `Read()` bloquait indéfiniment et le check `$sync.CancelRequested` n'était jamais évalué — bouton « Annuler » sans effet. Lecture désormais **100 % asynchrone**, et la boucle de polling vérifie cancel + exit toutes les 80 ms sans jamais bloquer.
+- **Kill complet de l'arborescence de processus** : utilise désormais `taskkill /T /F /PID <pid>` au lieu de `Process.Kill()`.
+- **Fermeture de la fenêtre quand une opération est hung** : `Window.Closing` force-kill maintenant l'arborescence + `Window.Closed` clôture la runspace dans un Task avec timeout 2s.
+
+### ✨ Ajouté
+
+- **Bouton « ✕ Arrêter »** directement dans le **bandeau de progression** (en haut, visible quand une tâche est en cours).
+- **Tracking** du processus courant via `$sync.CurrentProcess` — kill immédiat depuis l'UI.
+
+---
+
 ## [1.1.1] — 2026-05-09
 
 ### 🐛 Corrigé
@@ -95,6 +135,8 @@ Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le pr
 
 ---
 
+[1.1.2]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.2
+[1.1.3]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.3
 [1.1.2]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.2
 [1.1.1]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.1
 [1.1.0]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.0

@@ -62,13 +62,37 @@ if (-not $ps2exe) {
 
 Import-Module ps2exe -Force -ErrorAction Stop
 
+# Injection du logo (logo.png en base64) dans une copie temporaire du .ps1.
+# Le logo n'est pas committé dans le repo (gitignored) : il est embarqué uniquement
+# dans le .exe final via cette injection au moment de la compilation.
+$logoPath = Join-Path $PSScriptRoot 'logo.png'
+$buildSource = $Source
+if (Test-Path $logoPath) {
+    Write-Step "Logo trouve : $logoPath — injection en base64..." 'OK'
+    $logoBytes = [System.IO.File]::ReadAllBytes($logoPath)
+    $logoB64 = [Convert]::ToBase64String($logoBytes)
+    Write-Step ("  Taille logo : {0:N0} octets / base64 : {1:N0} car." -f $logoBytes.Length, $logoB64.Length)
+    $srcContent = [System.IO.File]::ReadAllText($Source, [System.Text.UTF8Encoding]::new($true))
+    if ($srcContent.Contains('@@LOGO_PNG_BASE64@@')) {
+        $srcContent = $srcContent.Replace('@@LOGO_PNG_BASE64@@', $logoB64)
+        $tempPs1 = Join-Path $env:TEMP "TitaliumRepairBuild_$([Guid]::NewGuid().ToString('N')).ps1"
+        [System.IO.File]::WriteAllText($tempPs1, $srcContent, [System.Text.UTF8Encoding]::new($true))
+        $buildSource = $tempPs1
+        Write-Step "  Source temporaire avec logo injecte : $tempPs1" 'OK'
+    } else {
+        Write-Step "  Placeholder @@LOGO_PNG_BASE64@@ introuvable dans le .ps1 — logo non injecte." 'WARN'
+    }
+} else {
+    Write-Step 'Aucun logo.png — fallback "T" stylise.' 'WARN'
+}
+
 # Compilation
 Write-Host ''
 Write-Step 'Compilation en cours...'
 Write-Host ''
 
 $ps2exeArgs = @{
-    inputFile     = $Source
+    inputFile     = $buildSource
     outputFile    = $Output
     noConsole     = $true
     STA           = $true
@@ -95,7 +119,13 @@ try {
     Invoke-ps2exe @ps2exeArgs
 } catch {
     Write-Step "Erreur de compilation : $($_.Exception.Message)" 'ERROR'
+    if ($buildSource -ne $Source) { try { Remove-Item -LiteralPath $buildSource -Force -EA SilentlyContinue } catch {} }
     exit 1
+}
+
+# Cleanup de la copie temporaire avec logo injecté (ne reste pas sur disque)
+if ($buildSource -ne $Source) {
+    try { Remove-Item -LiteralPath $buildSource -Force -EA SilentlyContinue } catch {}
 }
 
 if (Test-Path $Output) {

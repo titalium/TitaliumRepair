@@ -1,5 +1,5 @@
 {
-  "version": "1.1.2",
+  "version": "1.1.3",
   "released": "2026-05-09",
   "name": "Titalium Repair Tool",
   "author": "Titalium",
@@ -10,10 +10,14 @@
   "minWindowsVersion": "10.0.18363",
   "requiresAdmin": true,
   "changelog": [
-    "[FIX] Annulation d'opération bloquante : Run-Process bloquait sur la lecture stdout quand un processus enfant ne répondait plus (ex : net stop cryptsvc). Lecture désormais 100% asynchrone via DataReceivedEventHandler — la boucle principale poll cancel + exit toutes les 80 ms et ne bloque jamais",
-    "[FIX] Kill complet de l'arborescence de processus : utilise taskkill /T /F au lieu de Process.Kill() (qui ne tue pas les descendants). Indispensable pour net.exe → sc.exe, dism qui spawn des sous-processus, etc.",
-    "[NEW] Bouton « ✕ Arrêter » dans le bandeau de progression — visible quand une tâche est en cours, plus accessible que le bouton du status bar",
-    "[NEW] Tracking du processus courant via $sync.CurrentProcess pour permettre un kill immédiat depuis l'UI",
-    "[FIX] Fermeture de la fenêtre quand une opération est hung : Window.Closing force-kill l'arborescence + Window.Closed clôture la runspace avec timeout 2s — plus de blocage à la sortie"
+    "[NEW] Logo Titalium personnalisé en haut de l'app (injecté à la compilation, source non versionnée)",
+    "[NEW] Bouton « ✓ Tout » sur tous les DataGrids avec checkboxes (Logiciels, Bloatware, Pilotes, Démarrage, Services, Processus) — toggle smart : si tout coché → décoche tout, sinon coche tout",
+    "[FIX] Run-Process : détection EOF via ReadLineAsync().Result == null (au lieu de StreamReader.EndOfStream qui bloque). Plus de freeze sur ipconfig/ping/traceroute",
+    "[FIX] WMI verify : pré-checks PowerShell (Get-Service Winmgmt, Get-CimInstance) + try/catch outer. Plus de crash quand WMI sain ou en sortie rapide",
+    "[FIX] Catroot2 / SoftwareDistribution : try/catch outer + redémarrage forcé du service en finally pour ne pas laisser Windows Update cassé",
+    "[FIX] Inventaire pilotes : Get-CimInstance Win32_PnPSignedDriver remplace pnputil (~10× plus rapide), tri par date avec libellés visuels",
+    "[FIX] Pilotes — bouton « Aide MAJ » : copie infos dans le presse-papier + ouvre ms-settings:windowsupdate-optionalupdates (au lieu d'ouvrir un navigateur Google)",
+    "[FIX] Op-Info* : tous convertis en DataGrid Section/Propriété/Valeur (CPU, RAM, GPU, Disques, SMART, Uptime, Réseau)",
+    "[FIX] Anti-orphelin process : Job Object Windows avec KILL_ON_JOB_CLOSE (tue les enfants sfc/dism/net automatiquement quand parent meurt) + tracking PID + Environment.Exit(0) en finally"
   ]
 }

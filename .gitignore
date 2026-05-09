@@ -7,6 +7,11 @@ TitaliumRepair.exe
 .tools/
 *.nupkg
 
+# Assets locaux non publiés (logo de marque, icône)
+*.png
+logo.png
+*.ico
+
 # Icône optionnelle générée localement
 TitaliumRepair.ico
 

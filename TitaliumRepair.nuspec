@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
   <metadata>
     <id>TitaliumRepair</id>
-    <version>1.1.2</version>
+    <version>1.1.3</version>
     <title>Titalium Repair Tool</title>
     <authors>Titalium</authors>
     <owners>Titalium</owners>
@@ -13,7 +13,7 @@
     <readme>README.md</readme>
     <description>Couteau-suisse de réparation et d'optimisation Windows. Interface WPF moderne, 80+ outils (SFC, DISM, winget, registre, pilotes, bloatware, BSOD, télémétrie, etc.) en un seul .exe portable.</description>
     <summary>Outil portable de réparation Windows avec UI WPF moderne.</summary>
-    <releaseNotes>https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.2</releaseNotes>
+    <releaseNotes>https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.3</releaseNotes>
     <copyright>Copyright (c) 2026 Titalium — Apache-2.0</copyright>
     <tags>windows windows-10 windows-11 repair sysadmin powershell wpf sfc dism winget portable system-cleaner registry-cleaner bloatware-removal driver-updater</tags>
   </metadata>

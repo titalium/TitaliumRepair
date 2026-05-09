@@ -2,9 +2,9 @@
 #   TITALIUM REPAIR TOOL
 #   Réparation et optimisation Windows — Interface graphique moderne
 #   Auteur : Titalium  (https://titalium.fr)
-#   Version : 1.1.2
+#   Version : 1.1.3
 # =============================================================================
-$script:AppVersion = '1.1.2'
+$script:AppVersion = '1.1.3'
 # Repo GitHub où sont publiées les releases
 $script:GitHubRepo = 'titalium/TitaliumRepair'
 
@@ -35,6 +35,90 @@ Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Xaml
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName Microsoft.VisualBasic
+
+# Job Object Windows : tous les processus enfants spawnés via Run-Process seront
+# assignés à ce job. Le flag KILL_ON_JOB_CLOSE garantit que si notre .exe meurt
+# (proprement ou par crash), TOUS les enfants sont tués automatiquement par
+# le kernel Windows. Plus de processus orphelins (sfc, dism, net stop, winmgmt...).
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public static class TitaliumJob {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateJobObject(IntPtr a, string name);
+    [DllImport("kernel32.dll")]
+    public static extern bool SetInformationJobObject(IntPtr hJob, int infoType, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    public const int JobObjectExtendedLimitInformation = 9;
+
+    public static IntPtr Job = IntPtr.Zero;
+
+    public static bool Init() {
+        if (Job != IntPtr.Zero) return true;
+        Job = CreateJobObject(IntPtr.Zero, null);
+        if (Job == IntPtr.Zero) return false;
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        int size = Marshal.SizeOf(info);
+        IntPtr ptr = Marshal.AllocHGlobal(size);
+        try {
+            Marshal.StructureToPtr(info, ptr, false);
+            return SetInformationJobObject(Job, JobObjectExtendedLimitInformation, ptr, (uint)size);
+        } finally { Marshal.FreeHGlobal(ptr); }
+    }
+
+    public static bool Add(int pid) {
+        try {
+            if (Job == IntPtr.Zero) return false;
+            var p = Process.GetProcessById(pid);
+            return AssignProcessToJobObject(Job, p.Handle);
+        } catch { return false; }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
+# Init du job. Si ça échoue (rare : Win < 10 ou contexte exotique), on tombera
+# sur le fallback de tracking manuel des PIDs (voir Run-Process et le finally
+# en bas du script).
+$null = [TitaliumJob]::Init()
 #endregion
 
 #region État partagé
@@ -60,6 +144,9 @@ $sync.DriverUpdates = New-Object System.Collections.ObjectModel.ObservableCollec
 $sync.StartupItems = New-Object System.Collections.ObjectModel.ObservableCollection[psobject]
 $sync.ServicesItems = New-Object System.Collections.ObjectModel.ObservableCollection[psobject]
 $sync.ProcessesItems = New-Object System.Collections.ObjectModel.ObservableCollection[psobject]
+$sync.InfoItems = New-Object System.Collections.ObjectModel.ObservableCollection[psobject]
+# Tracking des PIDs enfants pour cleanup en cas de crash (fallback si Job Object indisponible)
+$sync.SpawnedPids = New-Object 'System.Collections.Concurrent.ConcurrentDictionary[int,bool]'
 # Queue concurrente pour marshaller les updates UI depuis le worker runspace
 # vers le thread UI sans utiliser Dispatcher.BeginInvoke (qui pose problème
 # avec les scriptblocks créés dans un runspace différent en PowerShell + WPF)
@@ -327,8 +414,19 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
               <GradientStop Color="#0098B3" Offset="1"/>
             </LinearGradientBrush>
           </Border.Background>
-          <TextBlock Text="T" FontFamily="Segoe UI" FontSize="22" FontWeight="Bold"
-                     Foreground="#0A0E1A" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          <Grid>
+            <TextBlock x:Name="LogoFallback" Text="T" FontFamily="Segoe UI" FontSize="22" FontWeight="Bold"
+                       Foreground="#0A0E1A" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <Image x:Name="LogoImage" Stretch="UniformToFill">
+              <Image.OpacityMask>
+                <VisualBrush>
+                  <VisualBrush.Visual>
+                    <Border Width="40" Height="40" Background="Black" CornerRadius="8"/>
+                  </VisualBrush.Visual>
+                </VisualBrush>
+              </Image.OpacityMask>
+            </Image>
+          </Grid>
         </Border>
         <StackPanel VerticalAlignment="Center">
           <TextBlock Text="TITALIUM REPAIR TOOL" Foreground="White" FontWeight="Bold" FontSize="16"/>
@@ -633,9 +731,10 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                     <TextBlock x:Name="WingetCount" Style="{StaticResource SectionDesc}" Margin="0" Text="Cliquez sur « Lister les MAJ » pour analyser."/>
                   </StackPanel>
                   <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
-                    <Button x:Name="BtnWingetList" Content="Lister les MAJ" Width="150" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
-                    <Button x:Name="BtnWingetUpdateSel" Content="Mettre à jour sélection" Width="200" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
-                    <Button x:Name="BtnWingetUpdateAll" Content="Tout mettre à jour" Width="170" Style="{StaticResource DangerButton}"/>
+                    <Button x:Name="BtnWingetList" Content="Lister les MAJ" Width="140" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnWingetSelectAll" Content="✓ Tout" Width="80" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnWingetUpdateSel" Content="MAJ sélection" Width="140" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnWingetUpdateAll" Content="Tout mettre à jour" Width="160" Style="{StaticResource DangerButton}"/>
                   </StackPanel>
                 </Grid>
                 <DataGrid x:Name="WingetGrid" MinHeight="240" MaxHeight="380" CanUserAddRows="False">
@@ -668,10 +767,11 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                     <TextBlock x:Name="InstalledCount" Style="{StaticResource SectionDesc}" Margin="0" Text="Cliquez sur « Lister » pour afficher tous les logiciels installés."/>
                   </StackPanel>
                   <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
-                    <TextBox x:Name="InstalledFilter" Width="200" Height="32" Margin="0,0,8,0"
+                    <TextBox x:Name="InstalledFilter" Width="180" Height="32" Margin="0,0,8,0"
                              VerticalContentAlignment="Center" ToolTip="Filtre rapide (laissez vide pour tout afficher)"/>
-                    <Button x:Name="BtnWingetListInstalled" Content="Lister installés" Width="160" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
-                    <Button x:Name="BtnWingetUninstallSel" Content="Désinstaller sélection" Width="200" Style="{StaticResource DangerButton}"/>
+                    <Button x:Name="BtnWingetListInstalled" Content="Lister installés" Width="140" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnInstalledSelectAll" Content="✓ Tout" Width="80" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnWingetUninstallSel" Content="Désinstaller sélection" Width="180" Style="{StaticResource DangerButton}"/>
                   </StackPanel>
                 </Grid>
                 <DataGrid x:Name="InstalledGrid" MinHeight="200" MaxHeight="320" CanUserAddRows="False">
@@ -720,8 +820,11 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                     <TextBlock x:Name="DriversCount" Style="{StaticResource SectionDesc}" Margin="0" Text="Cliquez sur « Rechercher » pour interroger Windows Update."/>
                   </StackPanel>
                   <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
-                    <Button x:Name="BtnDriversSearch" Content="Rechercher MAJ pilotes" Width="200" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
-                    <Button x:Name="BtnDriversInstallSel" Content="Installer sélection" Width="180" Style="{StaticResource ActionButton}"/>
+                    <Button x:Name="BtnDriversSearch" Content="Rechercher MAJ" Width="150" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnDriversInventory" Content="Inventaire local" Width="150" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnDriversSelectAll" Content="✓ Tout" Width="80" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnDriversInstallSel" Content="Installer / Aide MAJ" Width="180" Style="{StaticResource ActionButton}"
+                            ToolTip="En mode Microsoft Update : installe les pilotes sélectionnés. En mode inventaire local : copie les infos dans le presse-papier et ouvre la page « Mises à jour optionnelles » de Windows."/>
                   </StackPanel>
                 </Grid>
                 <DataGrid x:Name="DriversGrid" MinHeight="200" MaxHeight="320" CanUserAddRows="False">
@@ -735,7 +838,7 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                     </DataGridTemplateColumn>
                     <DataGridTextColumn Header="Pilote" Binding="{Binding Title}" Width="*"/>
                     <DataGridTextColumn Header="Catégorie" Binding="{Binding Category}" Width="160"/>
-                    <DataGridTextColumn Header="Taille" Binding="{Binding Size}" Width="100"/>
+                    <DataGridTextColumn Header="Date / Taille" Binding="{Binding Size}" Width="170"/>
                   </DataGrid.Columns>
                 </DataGrid>
               </StackPanel>
@@ -767,6 +870,7 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                   <TextBlock Grid.Column="0" Style="{StaticResource SectionHeader}" Text="Programmes au démarrage" FontSize="14"/>
                   <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <Button x:Name="BtnPerfStartup" Content="Lister" Width="100" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnStartupSelectAll" Content="✓ Tout" Width="80" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
                     <Button x:Name="BtnStartupDisable" Content="Désactiver sélection" Width="180" Style="{StaticResource DangerButton}"/>
                   </StackPanel>
                 </Grid>
@@ -794,6 +898,7 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                   <TextBlock Grid.Column="0" Style="{StaticResource SectionHeader}" Text="Services Windows" FontSize="14"/>
                   <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <Button x:Name="BtnPerfServices" Content="Lister" Width="100" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnServicesSelectAll" Content="✓ Tout" Width="80" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
                     <Button x:Name="BtnServiceStop" Content="Arrêter sélection" Width="160" Style="{StaticResource DangerButton}" Margin="0,0,8,0"/>
                     <Button x:Name="BtnServiceStart" Content="Démarrer sélection" Width="170" Style="{StaticResource ActionButton}"/>
                   </StackPanel>
@@ -823,6 +928,7 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                   <TextBlock Grid.Column="0" Style="{StaticResource SectionHeader}" Text="Top processus" FontSize="14"/>
                   <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <Button x:Name="BtnPerfTopProcs" Content="Rafraîchir" Width="120" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnProcessSelectAll" Content="✓ Tout" Width="80" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
                     <Button x:Name="BtnProcessKill" Content="Tuer sélection" Width="160" Style="{StaticResource DangerButton}"/>
                   </StackPanel>
                 </Grid>
@@ -868,6 +974,7 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
                   </StackPanel>
                   <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
                     <Button x:Name="BtnBloatList" Content="Lister bloatware" Width="160" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnBloatSelectAll" Content="✓ Tout" Width="80" Style="{StaticResource ActionButton}" Margin="0,0,8,0"/>
                     <Button x:Name="BtnBloatRemove" Content="Désinstaller sélection" Width="200" Style="{StaticResource DangerButton}"/>
                   </StackPanel>
                 </Grid>
@@ -940,20 +1047,28 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
           <!-- ============ INFOS SYSTÈME ============ -->
           <StackPanel x:Name="PanelInfo" Visibility="Collapsed">
             <TextBlock Style="{StaticResource SectionHeader}" Text="Informations système"/>
-            <TextBlock Style="{StaticResource SectionDesc}" Text="Caractéristiques matérielles et logicielles du poste."/>
+            <TextBlock Style="{StaticResource SectionDesc}" Text="Caractéristiques matérielles et logicielles du poste — affichage en tableau."/>
             <Border Style="{StaticResource CardBorder}">
               <StackPanel>
-                <WrapPanel>
-                  <Button x:Name="BtnInfoSummary" Content="Récapitulatif système" Width="220" Style="{StaticResource ActionButton}"/>
+                <TextBlock Style="{StaticResource SectionHeader}" Text="Choix de la rubrique" FontSize="14"/>
+                <WrapPanel Margin="0,0,0,8">
+                  <Button x:Name="BtnInfoSummary" Content="Récapitulatif" Width="160" Style="{StaticResource ActionButton}"/>
                   <Button x:Name="BtnInfoCpu" Content="CPU" Width="100" Style="{StaticResource ActionButton}"/>
                   <Button x:Name="BtnInfoRam" Content="RAM" Width="100" Style="{StaticResource ActionButton}"/>
                   <Button x:Name="BtnInfoGpu" Content="GPU" Width="100" Style="{StaticResource ActionButton}"/>
                   <Button x:Name="BtnInfoDisks" Content="Disques" Width="120" Style="{StaticResource ActionButton}"/>
                   <Button x:Name="BtnInfoSmart" Content="Santé disques (SMART)" Width="220" Style="{StaticResource ActionButton}"/>
-                  <Button x:Name="BtnInfoBattery" Content="Rapport batterie (laptop)" Width="220" Style="{StaticResource ActionButton}"/>
                   <Button x:Name="BtnInfoUptime" Content="Uptime" Width="120" Style="{StaticResource ActionButton}"/>
                   <Button x:Name="BtnInfoNet" Content="Adresses IP / MAC" Width="200" Style="{StaticResource ActionButton}"/>
+                  <Button x:Name="BtnInfoBattery" Content="Rapport batterie (HTML)" Width="220" Style="{StaticResource ActionButton}"/>
                 </WrapPanel>
+                <DataGrid x:Name="InfoGrid" MinHeight="240" MaxHeight="500" CanUserAddRows="False" Margin="0,8,0,0">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="Section" Binding="{Binding Section}" Width="160"/>
+                    <DataGridTextColumn Header="Propriété" Binding="{Binding Property}" Width="220"/>
+                    <DataGridTextColumn Header="Valeur" Binding="{Binding Value}" Width="*"/>
+                  </DataGrid.Columns>
+                </DataGrid>
               </StackPanel>
             </Border>
           </StackPanel>
@@ -1107,12 +1222,31 @@ $sync.Progress = $ctrl.MainProgress
 $sync.BtnCancel = $ctrl.BtnCancel
 $sync.WingetGrid = $ctrl.WingetGrid
 $sync.WingetCount = $ctrl.WingetCount
+# Logo : injecté en base64 par Build-Exe.ps1 au moment de la compilation.
+# Si vide (lancement direct du .ps1 sans injection), fallback sur le "T" stylisé.
+$script:LogoBase64 = '@@LOGO_PNG_BASE64@@'
+if ($script:LogoBase64 -and $script:LogoBase64 -ne '@@LOGO_PNG_BASE64@@' -and $script:LogoBase64.Length -gt 100) {
+    try {
+        $logoBytes = [Convert]::FromBase64String($script:LogoBase64)
+        $logoStream = New-Object System.IO.MemoryStream(,$logoBytes)
+        $logoBmp = New-Object System.Windows.Media.Imaging.BitmapImage
+        $logoBmp.BeginInit()
+        $logoBmp.StreamSource = $logoStream
+        $logoBmp.CacheOption = 'OnLoad'
+        $logoBmp.EndInit()
+        $logoBmp.Freeze()
+        $ctrl.LogoImage.Source = $logoBmp
+        $ctrl.LogoFallback.Visibility = 'Collapsed'
+    } catch {}
+}
+
 $ctrl.WingetGrid.ItemsSource = $sync.WingetUpgrades
 $ctrl.BloatGrid.ItemsSource = $sync.BloatList
 $ctrl.DriversGrid.ItemsSource = $sync.DriverUpdates
 $ctrl.StartupGrid.ItemsSource = $sync.StartupItems
 $ctrl.ServicesGrid.ItemsSource = $sync.ServicesItems
 $ctrl.ProcessesGrid.ItemsSource = $sync.ProcessesItems
+$ctrl.InfoGrid.ItemsSource = $sync.InfoItems
 $ctrl.InstalledGrid.ItemsSource = [System.Windows.Data.CollectionViewSource]::GetDefaultView($sync.WingetInstalled)
 $ctrl.InstalledFilter.Add_TextChanged({
     $f = $ctrl.InstalledFilter.Text
@@ -1190,6 +1324,9 @@ $sync.UITimer.Add_Tick({
                     'ServicesAdd'  { $sync.ServicesItems.Add($item.Item) }
                     'ProcessesClear'{ $sync.ProcessesItems.Clear() }
                     'ProcessesAdd' { $sync.ProcessesItems.Add($item.Item) }
+                    'InfoClear'    { $sync.InfoItems.Clear() }
+                    'InfoAdd'      { $sync.InfoItems.Add($item.Item) }
+                    'InfoSection'  { $sync.InfoItems.Add([pscustomobject]@{ Section=$item.Text; Property=''; Value='' }) }
                     'ProgressShow' {
                         $ctrl.ProgressBanner.Visibility = 'Visible'
                         $ctrl.BannerTitle.Text = $item.Title
@@ -1479,6 +1616,56 @@ function Set-Status {
     param([string]$Text)
     $sync.UIQueue.Enqueue([pscustomobject]@{ Action='StatusBusy'; Text=$Text })
 }
+function Add-InfoRow {
+    param([string]$Section, [string]$Property, [string]$Value)
+    $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoAdd'; Item=[pscustomobject]@{ Section=$Section; Property=$Property; Value=$Value } })
+}
+function Op-DriversInventoryInternal {
+    try {
+        $sync.DriverFallbackMode = $true
+        Write-Log "Inventaire des pilotes signés (Win32_PnPSignedDriver)..."
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversClear' })
+        $now = Get-Date
+        $drivers = Get-CimInstance Win32_PnPSignedDriver -EA SilentlyContinue |
+            Where-Object { $_.DeviceName -or $_.FriendlyName } |
+            Sort-Object @{Expression={ try { if ($_.DriverDate) { $_.DriverDate } else { $now } } catch { $now } }}
+        $count = 0
+        foreach ($d in $drivers) {
+            $devName = if ($d.DeviceName) { $d.DeviceName } else { $d.FriendlyName }
+            $manuf = if ($d.Manufacturer) { $d.Manufacturer } else { 'inconnu' }
+            $version = if ($d.DriverVersion) { $d.DriverVersion } else { '?' }
+            $devClass = if ($d.DeviceClass) { $d.DeviceClass } else { '' }
+            $dateLabel = '?'
+            try {
+                if ($d.DriverDate) {
+                    $dateLabel = $d.DriverDate.ToString('yyyy-MM-dd')
+                    $age = ($now - $d.DriverDate).TotalDays
+                    if ($age -gt 365 * 5) { $dateLabel += '  [!] tres ancien' }
+                    elseif ($age -gt 365 * 3) { $dateLabel += '  [!] ancien' }
+                    elseif ($age -gt 365 * 2) { $dateLabel += '  - 2+ ans' }
+                }
+            } catch {}
+            $title = "$devName -- $manuf (v$version)"
+            $obj = [pscustomobject]@{
+                Selected = $false
+                Index = -1
+                Title = $title
+                Category = $devClass
+                Size = $dateLabel
+                DeviceName = $devName
+                Manufacturer = $manuf
+                Version = $version
+            }
+            $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversAdd'; Item=$obj })
+            $count++
+        }
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversCount'; Text="$count pilotes installes. Tries du plus ancien au plus recent. Coche un pilote + clic 'Installer / Rechercher en ligne' pour ouvrir une recherche Google chez le constructeur." })
+        Write-Log "$count pilote(s) listé(s)." 'OK'
+        Write-Log "Mode inventaire : 'Installer / Rechercher en ligne' ouvre Google pour le pilote selectionne." 'INFO'
+    } catch {
+        Write-Log "Erreur inventaire pilotes : $($_.Exception.Message)" 'ERROR'
+    }
+}
 function Run-Process {
     param([string]$File, [string]$Arguments = '', [switch]$NoOutput)
     Write-Log "→ $File $Arguments"
@@ -1494,76 +1681,98 @@ function Run-Process {
         $psi.StandardErrorEncoding = [System.Text.Encoding]::GetEncoding(850)
         $p = New-Object System.Diagnostics.Process
         $p.StartInfo = $psi
-        $p.EnableRaisingEvents = $true
-
-        # File concurrente partagée pour les lignes capturées en async (jamais bloquant)
-        $outQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
-        $handler = [System.Diagnostics.DataReceivedEventHandler]{
-            param($s, $e)
-            if ($null -ne $e -and $null -ne $e.Data) { $outQueue.Enqueue($e.Data) }
-        }
-        $p.add_OutputDataReceived($handler)
-        $p.add_ErrorDataReceived($handler)
-
         [void]$p.Start()
         $sync.CurrentProcess = $p
-        $p.BeginOutputReadLine()
-        $p.BeginErrorReadLine()
+        # Assigne le process enfant au Job Object — il sera tué automatiquement
+        # si le .exe parent meurt (crash, Task Manager kill, fermeture inattendue).
+        try { [TitaliumJob]::Add($p.Id) | Out-Null } catch {}
+        # Tracking en parallèle (fallback si Job Object n'a pas pu être créé)
+        try { $null = $sync.SpawnedPids.TryAdd($p.Id, $true) } catch {}
 
         $progressRegex = [regex]'(\d{1,3}(?:[.,]\d+)?)\s*%'
         $cancelled = $false
+        $outTask = $null
+        $errTask = $null
+        $outDone = $false
+        $errDone = $false
 
-        # Boucle de polling NON-BLOQUANTE : check cancel + drain queue + sleep court
-        while (-not $p.HasExited) {
+        # Boucle de polling : utilise StreamReader.ReadLineAsync() + Task.WaitAny(100ms).
+        # IMPORTANT : on n'utilise PAS StreamReader.EndOfStream qui BLOQUE en lisant à
+        # l'avance. On détecte EOF via ReadLineAsync().Result == null à la place.
+        while (-not ($outDone -and $errDone)) {
             if ($sync.CancelRequested) {
                 $cancelled = $true
-                Write-Log "Annulation demandée — kill du processus PID $($p.Id) et de ses descendants..." 'WARN'
+                Write-Log "Annulation — kill du processus PID $($p.Id) et descendants..." 'WARN'
                 try {
-                    # taskkill /T /F : tue toute l'arborescence (net.exe → sc.exe → ...)
                     $tk = [System.Diagnostics.Process]::Start('taskkill.exe', "/T /F /PID $($p.Id)")
                     if ($tk) { $tk.WaitForExit(3000) | Out-Null }
                 } catch {}
-                # Belt & suspenders : kill direct si toujours vivant
                 try { if (-not $p.HasExited) { $p.Kill() } } catch {}
                 break
             }
 
-            if (-not $NoOutput) {
+            # Lance une lecture si pas déjà en cours et stream pas marqué EOF
+            if ($null -eq $outTask -and -not $outDone) {
+                try { $outTask = $p.StandardOutput.ReadLineAsync() } catch { $outDone = $true }
+            }
+            if ($null -eq $errTask -and -not $errDone) {
+                try { $errTask = $p.StandardError.ReadLineAsync() } catch { $errDone = $true }
+            }
+
+            # Attend qu'une des tâches complète (max 100 ms) — sans jamais bloquer indéfiniment
+            $waitTasks = @()
+            if ($null -ne $outTask) { $waitTasks += $outTask }
+            if ($null -ne $errTask) { $waitTasks += $errTask }
+            if ($waitTasks.Count -gt 0) {
+                try { [System.Threading.Tasks.Task]::WaitAny($waitTasks, 100) | Out-Null } catch {}
+            } else {
+                # Plus de tâche en cours et tout est marqué EOF : break
+                break
+            }
+
+            # Consomme stdout
+            if ($null -ne $outTask -and $outTask.IsCompleted) {
                 $line = $null
-                while ($outQueue.TryDequeue([ref]$line)) {
-                    if ($line) {
-                        Write-Log "  $line"
-                        $m = $progressRegex.Match($line)
-                        if ($m.Success) {
-                            $pct = [double]($m.Groups[1].Value -replace ',', '.')
-                            if ($pct -ge 0 -and $pct -le 100) {
-                                $sync.UIQueue.Enqueue([pscustomobject]@{ Action='ProgressValue'; Value=$pct })
-                                $sync.UIQueue.Enqueue([pscustomobject]@{ Action='ProgressSubtext'; Text=$line })
-                            }
-                        } else {
+                try { $line = $outTask.Result } catch {}
+                $outTask = $null
+                if ($null -eq $line) {
+                    $outDone = $true   # ReadLineAsync renvoie null = vrai EOF
+                } elseif (-not $NoOutput -and $line) {
+                    Write-Log "  $line"
+                    $m = $progressRegex.Match($line)
+                    if ($m.Success) {
+                        $pct = [double]($m.Groups[1].Value -replace ',', '.')
+                        if ($pct -ge 0 -and $pct -le 100) {
+                            $sync.UIQueue.Enqueue([pscustomobject]@{ Action='ProgressValue'; Value=$pct })
                             $sync.UIQueue.Enqueue([pscustomobject]@{ Action='ProgressSubtext'; Text=$line })
                         }
+                    } elseif ($line.Length -gt 0) {
+                        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='ProgressSubtext'; Text=$line })
                     }
                 }
             }
 
-            Start-Sleep -Milliseconds 80
-        }
-
-        # Drain final pour ne perdre aucune ligne
-        Start-Sleep -Milliseconds 120
-        if (-not $NoOutput) {
-            $line = $null
-            while ($outQueue.TryDequeue([ref]$line)) {
-                if ($line) { Write-Log "  $line" }
+            # Consomme stderr
+            if ($null -ne $errTask -and $errTask.IsCompleted) {
+                $line = $null
+                try { $line = $errTask.Result } catch {}
+                $errTask = $null
+                if ($null -eq $line) {
+                    $errDone = $true
+                } elseif (-not $NoOutput -and $line) {
+                    Write-Log "  $line" 'WARN'
+                }
             }
         }
 
+        if (-not $p.HasExited) { $p.WaitForExit() }
         $exitCode = if ($cancelled) { -1 } else { $p.ExitCode }
         $sync.CurrentProcess = $null
+        # Retire le PID du tracking : process terminé proprement
+        try { $b = $false; $null = $sync.SpawnedPids.TryRemove($p.Id, [ref]$b) } catch {}
         return $exitCode
     } catch {
-        Write-Log "Erreur : $($_.Exception.Message)" 'ERROR'
+        Write-Log "Erreur Run-Process : $($_.Exception.Message)" 'ERROR'
         $sync.CurrentProcess = $null
         return -1
     }
@@ -1654,12 +1863,37 @@ function Op-ReregisterDLLs {
 function Op-Wmi {
     Wrap-Action {
         Write-LogTitle "Vérification WMI"
-        $code = Run-Process 'winmgmt.exe' '/verifyrepository'
-        if ($code -ne 0) {
-            Write-Log "Problème WMI détecté. Tentative de réparation..." 'WARN'
-            Run-Process 'winmgmt.exe' '/salvagerepository'
-        } else {
-            Write-Log "WMI sain." 'OK'
+        try {
+            # Pré-check 1 : service Winmgmt
+            $svc = Get-Service -Name 'Winmgmt' -EA SilentlyContinue
+            if (-not $svc) { Write-Log "Service Winmgmt introuvable !" 'ERROR'; return }
+            Write-Log "Service Winmgmt : $($svc.Status) ($($svc.StartType))"
+            if ($svc.Status -ne 'Running') {
+                Write-Log "Tentative de démarrage du service WMI..." 'WARN'
+                try { Start-Service -Name 'Winmgmt' -EA Stop; Write-Log "  ✓ Démarré" 'OK' } catch { Write-Log "  ✗ $($_.Exception.Message)" 'ERROR'; return }
+            }
+
+            # Pré-check 2 : requête CIM basique pour valider la disponibilité
+            try {
+                $os = Get-CimInstance Win32_OperatingSystem -EA Stop
+                Write-Log "Requête CIM OK ($($os.Caption))." 'OK'
+            } catch {
+                Write-Log "Le WMI répond mal aux requêtes : $($_.Exception.Message)" 'WARN'
+            }
+
+            # Pré-check 3 : winmgmt /verifyrepository (peut être lent)
+            Write-Log "Vérification du repository WMI..."
+            $code = Run-Process 'winmgmt.exe' '/verifyrepository'
+            if ($code -ne 0) {
+                Write-Log "Repository WMI incohérent (code $code). Tentative de réparation /salvagerepository..." 'WARN'
+                $r = Run-Process 'winmgmt.exe' '/salvagerepository'
+                if ($r -eq 0) { Write-Log "Réparation terminée." 'OK' }
+                else { Write-Log "Réparation a renvoyé un code $r — un reset complet (winmgmt /resetrepository) peut être nécessaire mais ce n'est pas automatique car risqué." 'WARN' }
+            } else {
+                Write-Log "Repository WMI sain." 'OK'
+            }
+        } catch {
+            Write-Log "Erreur Op-Wmi : $($_.Exception.Message)" 'ERROR'
         }
     }
 }
@@ -1832,23 +2066,49 @@ function Op-CleanRecycle {
 function Op-CleanSWD {
     Wrap-Action {
         Write-LogTitle "Nettoyage : SoftwareDistribution"
-        Run-Process 'net.exe' 'stop wuauserv' -NoOutput
-        Run-Process 'net.exe' 'stop bits' -NoOutput
-        $path = "$env:windir\SoftwareDistribution"
-        $d=0;$x=0; Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | ForEach-Object { try { Remove-Item $_.FullName -Recurse -Force -EA Stop; $d++ } catch { $x++ } }
-        Run-Process 'net.exe' 'start bits' -NoOutput
-        Run-Process 'net.exe' 'start wuauserv' -NoOutput
-        Write-Log "Supprimé : $d. Verrouillés : $x." 'OK'
+        try {
+            Write-Log "Arrêt des services Windows Update et BITS..."
+            Run-Process 'net.exe' 'stop wuauserv' -NoOutput
+            Run-Process 'net.exe' 'stop bits' -NoOutput
+            $path = "$env:windir\SoftwareDistribution"
+            $d=0;$x=0
+            if (Test-Path $path) {
+                Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try { Remove-Item $_.FullName -Recurse -Force -EA Stop; $d++ } catch { $x++ }
+                }
+            } else { Write-Log "Dossier $path introuvable." 'WARN' }
+            Write-Log "Redémarrage des services..."
+            Run-Process 'net.exe' 'start bits' -NoOutput
+            Run-Process 'net.exe' 'start wuauserv' -NoOutput
+            Write-Log "Supprimé : $d. Verrouillés : $x." 'OK'
+        } catch {
+            Write-Log "Erreur Op-CleanSWD : $($_.Exception.Message)" 'ERROR'
+            try { Run-Process 'net.exe' 'start bits' -NoOutput } catch {}
+            try { Run-Process 'net.exe' 'start wuauserv' -NoOutput } catch {}
+        }
     }
 }
 function Op-CleanCatroot {
     Wrap-Action {
         Write-LogTitle "Nettoyage : catroot2"
-        Run-Process 'net.exe' 'stop cryptsvc' -NoOutput
-        $path = "$env:windir\System32\catroot2"
-        $d=0;$x=0; Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | ForEach-Object { try { Remove-Item $_.FullName -Recurse -Force -EA Stop; $d++ } catch { $x++ } }
-        Run-Process 'net.exe' 'start cryptsvc' -NoOutput
-        Write-Log "Supprimé : $d. Verrouillés : $x." 'OK'
+        try {
+            Write-Log "Arrêt du service Cryptographic Services..."
+            Run-Process 'net.exe' 'stop cryptsvc' -NoOutput
+            $path = "$env:windir\System32\catroot2"
+            $d=0;$x=0
+            if (Test-Path $path) {
+                Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    try { Remove-Item $_.FullName -Recurse -Force -EA Stop; $d++ } catch { $x++ }
+                }
+            } else { Write-Log "Dossier $path introuvable." 'WARN' }
+            Write-Log "Redémarrage du service..."
+            Run-Process 'net.exe' 'start cryptsvc' -NoOutput
+            Write-Log "Supprimé : $d. Verrouillés : $x." 'OK'
+        } catch {
+            Write-Log "Erreur Op-CleanCatroot : $($_.Exception.Message)" 'ERROR'
+            # Tentative de redémarrage du service même en cas d'erreur (sinon Windows Update est cassé)
+            try { Run-Process 'net.exe' 'start cryptsvc' -NoOutput } catch {}
+        }
     }
 }
 function Op-CleanDeliveryOpt {
@@ -2337,67 +2597,55 @@ function Op-DriversSearch {
             Write-Log "Bascule sur l'inventaire local des pilotes installés..." 'WARN'
         }
 
-        # Tentative 2 : fallback inventaire des pilotes tiers via pnputil, trié par date
-        try {
-            $sync.DriverFallbackMode = $true
-            Write-Log "Inventaire des pilotes tiers installés..."
-            $output = & pnputil.exe /enum-drivers 2>&1 | Out-String
-            $lines = $output -split "`r?`n"
-            $allDrivers = @()
-            $current = $null
-            foreach ($line in $lines) {
-                if ($line -match '^(Published Name|Nom publi[ée])\s*:\s*(.+)$') {
-                    if ($current) { $allDrivers += $current }
-                    $current = [ordered]@{ Published=$Matches[2].Trim(); Original=''; Provider=''; Class=''; Date=''; Version='' }
-                } elseif ($current) {
-                    if ($line -match '^(Original Name|Nom original|Nom de fichier d''origine)\s*:\s*(.+)$') { $current.Original = $Matches[2].Trim() }
-                    elseif ($line -match '^(Provider Name|Fournisseur)\s*:\s*(.+)$') { $current.Provider = $Matches[2].Trim() }
-                    elseif ($line -match '^(Class Name|Nom de classe|Classe)\s*:\s*(.+)$') { $current.Class = $Matches[2].Trim() }
-                    elseif ($line -match '^(Driver Date|Date du pilote)\s*:\s*(.+)$') { $current.Date = $Matches[2].Trim() }
-                    elseif ($line -match '^(Driver Version|Version du pilote)\s*:\s*(.+)$') { $current.Version = $Matches[2].Trim() }
-                }
-            }
-            if ($current) { $allDrivers += $current }
-
-            # Tri du plus ancien au plus récent (cibles probables de MAJ en haut)
-            $sorted = $allDrivers | Sort-Object {
-                try { [DateTime]::Parse($_.Date) } catch { [DateTime]::MaxValue }
-            }
-            $count = 0
-            foreach ($d in $sorted) {
-                $name = if ($d.Original) { $d.Original } else { $d.Published }
-                $title = if ($d.Provider) { "$($d.Provider) — $name (v$($d.Version))" } else { "$name (v$($d.Version))" }
-                $obj = [pscustomobject]@{
-                    Selected = $false
-                    Index = -1
-                    Title = $title
-                    Category = $d.Class
-                    Size = $d.Date
-                }
-                $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversAdd'; Item=$obj })
-                $count++
-            }
-            $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversCount'; Text="$count pilotes tiers — triés du plus ancien au plus récent (la colonne Taille affiche la date). Microsoft Update indisponible : vérifie manuellement chez le constructeur ou via Paramètres → Windows Update." })
-            Write-Log "$count pilote(s) listé(s). Les plus anciens (potentiels candidats à MAJ) sont en haut." 'OK'
-            Write-Log "Note : en mode inventaire, le bouton « Installer sélection » n'est pas opérationnel — la MAJ doit se faire via Settings ou le site du fabricant." 'WARN'
-        } catch {
-            Write-Log "Erreur d'inventaire pnputil : $($_.Exception.Message)" 'ERROR'
-        }
+        # Tentative 2 : fallback inventaire via Win32_PnPSignedDriver (rapide)
+        Op-DriversInventoryInternal
     }
 }
+
+# Op-DriversInventoryInternal est désormais défini dans $initScript pour être
+# accessible depuis le runspace worker (où s'exécutent les Wrap-Action).
 function Op-DriversInstallSel {
     Wrap-Action {
-        Write-LogTitle "Installation des pilotes sélectionnés"
-        if ($sync.DriverFallbackMode) {
-            Write-Log "Mode inventaire : installation directe non disponible." 'WARN'
-            Write-Log "Pour mettre à jour ces pilotes :" 'WARN'
-            Write-Log "  • Paramètres Windows → Windows Update → Options avancées → Mises à jour facultatives → Pilotes" 'WARN'
-            Write-Log "  • OU télécharge le pilote depuis le site du fabricant (NVIDIA, Intel, AMD, Realtek...)" 'WARN'
-            return
-        }
-        if (-not $sync.DriverUpdatesCom) { Write-Log "Lance d'abord la recherche." 'WARN'; return }
+        Write-LogTitle "Action sur les pilotes sélectionnés"
         $selected = @($sync.DriverUpdates | Where-Object { $_.Selected })
         if ($selected.Count -eq 0) { Write-Log "Aucune sélection." 'WARN'; return }
+
+        if ($sync.DriverFallbackMode) {
+            # Mode inventaire : pas d'install COM possible (pas d'objets Update à passer
+            # à UpdateInstaller). On prépare une aide pratique pour la MAJ manuelle :
+            #   1. Copie les infos des pilotes sélectionnés dans le presse-papier
+            #   2. Ouvre la page Windows des MAJ optionnelles (où Microsoft expose
+            #      les drivers de son catalogue — c'est l'équivalent natif d'une recherche)
+            Write-Log "Mode inventaire : préparation de l'aide à la mise à jour..."
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine("Pilotes à mettre à jour ($($selected.Count) sélectionnés)")
+            [void]$sb.AppendLine(("=" * 60))
+            foreach ($d in $selected) {
+                $devName = if ($d.DeviceName) { $d.DeviceName } else { $d.Title }
+                $manuf = if ($d.Manufacturer) { $d.Manufacturer } else { '?' }
+                $version = if ($d.Version) { $d.Version } else { '?' }
+                [void]$sb.AppendLine("  - $devName")
+                [void]$sb.AppendLine("    Constructeur : $manuf")
+                [void]$sb.AppendLine("    Version actuelle : $version")
+                [void]$sb.AppendLine("")
+                Write-Log "  • $devName ($manuf, v$version)"
+            }
+            try {
+                Set-Clipboard -Value $sb.ToString()
+                Write-Log "Infos copiées dans le presse-papier ($($selected.Count) pilote(s))." 'OK'
+            } catch { Write-Log "Set-Clipboard indisponible : $($_.Exception.Message)" 'WARN' }
+            Write-Log "Ouverture des MAJ optionnelles Windows (où Microsoft expose les pilotes du catalogue)..."
+            try {
+                Start-Process 'ms-settings:windowsupdate-optionalupdates'
+                Write-Log "Page Settings ouverte." 'OK'
+            } catch {
+                try { Start-Process 'ms-settings:windowsupdate' } catch {}
+                Write-Log "Si rien ne s'ouvre : Paramètres → Windows Update → Options avancées → Mises à jour facultatives → Pilotes." 'INFO'
+            }
+            return
+        }
+
+        if (-not $sync.DriverUpdatesCom) { Write-Log "Lance d'abord la recherche." 'WARN'; return }
         Write-Log "$($selected.Count) pilote(s) à installer."
         try {
             $coll = New-Object -ComObject Microsoft.Update.UpdateColl
@@ -2426,8 +2674,8 @@ function Op-DriversInstallSel {
 }
 function Op-DriversList {
     Wrap-Action {
-        Write-LogTitle "Liste des pilotes"
-        Run-Process 'pnputil.exe' '/enum-drivers'
+        Write-LogTitle "Inventaire complet des pilotes"
+        Op-DriversInventoryInternal
     }
 }
 function Op-DriversBackup {
@@ -2684,68 +2932,141 @@ function Op-RecBcd {
     }
 }
 
-# ----- Infos système -----
+# ----- Infos système : tout passe par le DataGrid InfoGrid via la queue -----
+# Note : Add-InfoRow est défini dans $initScript pour être accessible depuis
+# le runspace worker.
 function Op-InfoSummary {
     Wrap-Action {
         Write-LogTitle "Récapitulatif système"
-        $os = Get-CimInstance Win32_OperatingSystem
-        $cs = Get-CimInstance Win32_ComputerSystem
-        $cpu = (Get-CimInstance Win32_Processor)[0]
-        Write-Log "  Hostname     : $($cs.Name)"
-        Write-Log "  OS           : $($os.Caption) $($os.Version) (build $($os.BuildNumber))"
-        Write-Log "  Architecture : $($os.OSArchitecture)"
-        Write-Log "  Constructeur : $($cs.Manufacturer) — $($cs.Model)"
-        Write-Log "  CPU          : $($cpu.Name)"
-        Write-Log "  Cœurs        : $($cpu.NumberOfCores) physiques / $($cpu.NumberOfLogicalProcessors) logiques"
-        $ram = '{0:N1} Go' -f ($cs.TotalPhysicalMemory / 1GB)
-        Write-Log "  RAM          : $ram"
-        $up = (Get-Date) - $os.LastBootUpTime
-        Write-Log "  Uptime       : $($up.Days)j $($up.Hours)h $($up.Minutes)m"
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem
+            $cs = Get-CimInstance Win32_ComputerSystem
+            $cpu = (Get-CimInstance Win32_Processor)[0]
+            Add-InfoRow 'Système' 'Hostname' "$($cs.Name)"
+            Add-InfoRow 'Système' 'Utilisateur' "$env:USERNAME"
+            Add-InfoRow 'Système' 'Domaine' "$($cs.Domain)"
+            Add-InfoRow 'Système' 'OS' "$($os.Caption)"
+            Add-InfoRow 'Système' 'Version' "$($os.Version) (build $($os.BuildNumber))"
+            Add-InfoRow 'Système' 'Architecture' "$($os.OSArchitecture)"
+            Add-InfoRow 'Système' 'Constructeur' "$($cs.Manufacturer)"
+            Add-InfoRow 'Système' 'Modèle' "$($cs.Model)"
+            Add-InfoRow 'CPU' 'Modèle' "$($cpu.Name)"
+            Add-InfoRow 'CPU' 'Cœurs physiques' "$($cpu.NumberOfCores)"
+            Add-InfoRow 'CPU' 'Cœurs logiques' "$($cpu.NumberOfLogicalProcessors)"
+            Add-InfoRow 'RAM' 'Total' ('{0:N1} Go' -f ($cs.TotalPhysicalMemory / 1GB))
+            $up = (Get-Date) - $os.LastBootUpTime
+            Add-InfoRow 'Système' 'Uptime' ("{0}j {1}h {2}m" -f $up.Days, $up.Hours, $up.Minutes)
+            Write-Log "Récap chargé." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
     }
 }
-function Op-InfoCpu { Wrap-Action { Write-LogTitle "CPU"; Get-CimInstance Win32_Processor | ForEach-Object { Write-Log "  $($_.Name)"; Write-Log "  Vitesse : $($_.MaxClockSpeed) MHz"; Write-Log "  Cœurs : $($_.NumberOfCores) phys / $($_.NumberOfLogicalProcessors) log" } } }
+function Op-InfoCpu {
+    Wrap-Action {
+        Write-LogTitle "CPU"
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
+        try {
+            $i = 0
+            Get-CimInstance Win32_Processor | ForEach-Object {
+                $section = "CPU $i"
+                Add-InfoRow $section 'Modèle' "$($_.Name)"
+                Add-InfoRow $section 'Vitesse max' "$($_.MaxClockSpeed) MHz"
+                Add-InfoRow $section 'Vitesse actuelle' "$($_.CurrentClockSpeed) MHz"
+                Add-InfoRow $section 'Cœurs physiques' "$($_.NumberOfCores)"
+                Add-InfoRow $section 'Cœurs logiques' "$($_.NumberOfLogicalProcessors)"
+                Add-InfoRow $section 'Architecture' "$($_.AddressWidth)-bit"
+                Add-InfoRow $section 'Socket' "$($_.SocketDesignation)"
+                Add-InfoRow $section 'Cache L2' "$($_.L2CacheSize) Ko"
+                Add-InfoRow $section 'Cache L3' "$($_.L3CacheSize) Ko"
+                Add-InfoRow $section 'Virtualisation' "$($_.VirtualizationFirmwareEnabled)"
+                $i++
+            }
+            Write-Log "CPU chargé." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
+    }
+}
 function Op-InfoRam {
     Wrap-Action {
         Write-LogTitle "RAM"
-        $mods = Get-CimInstance Win32_PhysicalMemory
-        $total = 0
-        foreach ($m in $mods) {
-            $total += $m.Capacity
-            $cap = '{0:N1} Go' -f ($m.Capacity / 1GB)
-            Write-Log "  Slot $($m.DeviceLocator) : $cap @ $($m.ConfiguredClockSpeed) MHz ($($m.Manufacturer) $($m.PartNumber))"
-        }
-        Write-Log ("  Total : {0:N1} Go" -f ($total / 1GB)) 'OK'
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
+        try {
+            $mods = Get-CimInstance Win32_PhysicalMemory
+            $total = 0
+            foreach ($m in $mods) {
+                $total += $m.Capacity
+                $section = "Slot $($m.DeviceLocator)"
+                Add-InfoRow $section 'Capacité' ('{0:N1} Go' -f ($m.Capacity / 1GB))
+                Add-InfoRow $section 'Vitesse' "$($m.ConfiguredClockSpeed) MHz"
+                Add-InfoRow $section 'Constructeur' "$($m.Manufacturer)"
+                Add-InfoRow $section 'Modèle' "$($m.PartNumber)"
+                $type = switch ([int]$m.SMBIOSMemoryType) { 24 {'DDR3'} 26 {'DDR4'} 34 {'DDR5'} default {"Type $($m.SMBIOSMemoryType)"} }
+                Add-InfoRow $section 'Type' $type
+            }
+            Add-InfoRow 'Total' 'Capacité installée' ('{0:N1} Go' -f ($total / 1GB))
+            Write-Log "RAM chargée." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
     }
 }
 function Op-InfoGpu {
     Wrap-Action {
         Write-LogTitle "GPU"
-        Get-CimInstance Win32_VideoController | ForEach-Object {
-            $vram = if ($_.AdapterRAM) { '{0:N1} Go' -f ($_.AdapterRAM / 1GB) } else { '?' }
-            Write-Log "  $($_.Name) — VRAM $vram, driver $($_.DriverVersion)"
-        }
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
+        try {
+            $i = 0
+            Get-CimInstance Win32_VideoController | ForEach-Object {
+                $section = "GPU $i — $($_.Name)"
+                $vram = if ($_.AdapterRAM) { '{0:N1} Go' -f ($_.AdapterRAM / 1GB) } else { '?' }
+                Add-InfoRow $section 'VRAM' $vram
+                Add-InfoRow $section 'Driver' "$($_.DriverVersion)"
+                Add-InfoRow $section 'Date driver' "$($_.DriverDate)"
+                Add-InfoRow $section 'Résolution actuelle' "$($_.CurrentHorizontalResolution) × $($_.CurrentVerticalResolution) @ $($_.CurrentRefreshRate) Hz"
+                Add-InfoRow $section 'Status' "$($_.Status)"
+                $i++
+            }
+            Write-Log "GPU chargé." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
     }
 }
 function Op-InfoDisks {
     Wrap-Action {
-        Write-LogTitle "Disques"
-        Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
-            $tot = '{0:N1} Go' -f ($_.Size / 1GB)
-            $free = '{0:N1} Go' -f ($_.FreeSpace / 1GB)
-            $pct = if ($_.Size) { [Math]::Round(($_.FreeSpace / $_.Size) * 100, 1) } else { 0 }
-            Write-Log "  $($_.DeviceID) — $free libres / $tot ($pct% libre) — $($_.FileSystem)"
-        }
+        Write-LogTitle "Disques (volumes logiques)"
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
+        try {
+            Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+                $section = "Volume $($_.DeviceID)"
+                $tot = '{0:N1} Go' -f ($_.Size / 1GB)
+                $free = '{0:N1} Go' -f ($_.FreeSpace / 1GB)
+                $pct = if ($_.Size) { [Math]::Round(($_.FreeSpace / $_.Size) * 100, 1) } else { 0 }
+                Add-InfoRow $section 'Étiquette' "$($_.VolumeName)"
+                Add-InfoRow $section 'Système de fichiers' "$($_.FileSystem)"
+                Add-InfoRow $section 'Espace total' $tot
+                Add-InfoRow $section 'Espace libre' $free
+                Add-InfoRow $section '% libre' "$pct%"
+            }
+            Write-Log "Disques chargés." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
     }
 }
 function Op-InfoSmart {
     Wrap-Action {
         Write-LogTitle "Santé disques (SMART)"
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
         try {
             $disks = Get-PhysicalDisk -EA SilentlyContinue
+            if (-not $disks) { Write-Log "Get-PhysicalDisk indisponible." 'WARN'; return }
+            $i = 0
             foreach ($d in $disks) {
-                Write-Log "  $($d.FriendlyName) [$($d.MediaType)] — Santé : $($d.HealthStatus) — Op : $($d.OperationalStatus)"
+                $section = "Disque $i — $($d.FriendlyName)"
+                Add-InfoRow $section 'Type' "$($d.MediaType)"
+                Add-InfoRow $section 'Bus' "$($d.BusType)"
+                Add-InfoRow $section 'Taille' ('{0:N1} Go' -f ($d.Size / 1GB))
+                Add-InfoRow $section 'Santé' "$($d.HealthStatus)"
+                Add-InfoRow $section 'Statut opérationnel' (($d.OperationalStatus) -join ', ')
+                Add-InfoRow $section 'Numéro de série' "$($d.SerialNumber)"
+                $i++
             }
-        } catch { Write-Log "Get-PhysicalDisk indisponible." 'WARN' }
+            Write-Log "$i disque(s) physique(s) listés." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
     }
 }
 function Op-InfoBattery {
@@ -2762,19 +3083,40 @@ function Op-InfoBattery {
 function Op-InfoUptime {
     Wrap-Action {
         Write-LogTitle "Uptime"
-        $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-        $up = (Get-Date) - $boot
-        Write-Log "  Démarré le : $boot"
-        Write-Log "  Uptime     : $($up.Days)j $($up.Hours)h $($up.Minutes)m $($up.Seconds)s"
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
+        try {
+            $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+            $up = (Get-Date) - $boot
+            Add-InfoRow 'Uptime' 'Démarré le' "$($boot.ToString('yyyy-MM-dd HH:mm:ss'))"
+            Add-InfoRow 'Uptime' 'Durée' ("{0}j {1}h {2}m {3}s" -f $up.Days, $up.Hours, $up.Minutes, $up.Seconds)
+            Add-InfoRow 'Uptime' 'Heures totales' ('{0:N1}' -f $up.TotalHours)
+            Write-Log "Uptime chargé." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
     }
 }
 function Op-InfoNet {
     Wrap-Action {
         Write-LogTitle "Adresses IP / MAC"
-        Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-            $ip = (Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -EA SilentlyContinue).IPAddress -join ', '
-            Write-Log "  $($_.Name) [$($_.MacAddress)]  → $ip"
-        }
+        $sync.UIQueue.Enqueue([pscustomobject]@{ Action='InfoClear' })
+        try {
+            $adapters = Get-NetAdapter -EA SilentlyContinue
+            foreach ($a in $adapters) {
+                $section = "$($a.Name) ($($a.InterfaceDescription))"
+                Add-InfoRow $section 'Statut' "$($a.Status)"
+                Add-InfoRow $section 'Type média' "$($a.MediaType)"
+                Add-InfoRow $section 'Vitesse liaison' "$($a.LinkSpeed)"
+                Add-InfoRow $section 'MAC' "$($a.MacAddress)"
+                $ipv4s = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -EA SilentlyContinue).IPAddress
+                if ($ipv4s) { Add-InfoRow $section 'IPv4' (($ipv4s) -join ', ') }
+                $ipv6s = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv6 -EA SilentlyContinue).IPAddress
+                if ($ipv6s) { Add-InfoRow $section 'IPv6' (($ipv6s) -join ', ') }
+                $gw = (Get-NetRoute -InterfaceIndex $a.InterfaceIndex -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue).NextHop
+                if ($gw) { Add-InfoRow $section 'Passerelle' (($gw) -join ', ') }
+                $dns = (Get-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -EA SilentlyContinue).ServerAddresses
+                if ($dns) { Add-InfoRow $section 'DNS' (($dns) -join ', ') }
+            }
+            Write-Log "$($adapters.Count) adaptateur(s) listé(s)." 'OK'
+        } catch { Write-Log "Erreur : $($_.Exception.Message)" 'ERROR' }
     }
 }
 
@@ -3535,15 +3877,21 @@ $ctrl.BtnWingetImport.Add_Click({
 })
 
 # Pilotes
-$ctrl.BtnDriversSearch.Add_Click({   Invoke-Async (Op-DriversSearch) 'Recherche MAJ pilotes...' })
+$ctrl.BtnDriversSearch.Add_Click({     Invoke-Async (Op-DriversSearch) 'Recherche MAJ pilotes...' })
+$ctrl.BtnDriversInventory.Add_Click({  Invoke-Async (Op-DriversList) 'Inventaire pilotes...' })
 $ctrl.BtnDriversInstallSel.Add_Click({
     $sel = @($sync.DriverUpdates | Where-Object { $_.Selected })
-    if ($sel.Count -eq 0) { Show-Warning "Coche au moins un pilote à installer."; return }
-    if (Confirm-Action "Installer les $($sel.Count) pilote(s) sélectionné(s) ? Un redémarrage peut être nécessaire.") {
-        Invoke-Async (Op-DriversInstallSel) 'Installation pilotes...'
+    if ($sel.Count -eq 0) { Show-Warning "Coche au moins un pilote dans la liste."; return }
+    if ($sync.DriverFallbackMode) {
+        # En mode inventaire : copie infos + ouvre Settings → MAJ optionnelles. Pas besoin de confirmation.
+        Invoke-Async (Op-DriversInstallSel) 'Préparation aide MAJ...'
+    } else {
+        if (Confirm-Action "Installer les $($sel.Count) pilote(s) sélectionné(s) ? Un redémarrage peut être nécessaire.") {
+            Invoke-Async (Op-DriversInstallSel) 'Installation pilotes...'
+        }
     }
 })
-$ctrl.BtnDriversList.Add_Click({     Invoke-Async (Op-DriversList) 'Liste pilotes...' })
+$ctrl.BtnDriversList.Add_Click({       Invoke-Async (Op-DriversList) 'Inventaire pilotes...' })
 $ctrl.BtnDriversBackup.Add_Click({
     $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
     $fbd.Description = "Dossier de sauvegarde des pilotes"
@@ -3701,6 +4049,30 @@ $cancelHandler = {
 }
 $ctrl.BtnCancel.Add_Click($cancelHandler)
 $ctrl.BtnBannerStop.Add_Click($cancelHandler)
+
+# --- Helper « Tout cocher » : bascule la propriété Selected de tous les items
+# d'une ObservableCollection. Si tous sont cochés → décoche tout. Sinon → coche tout.
+# Force le DataGrid à redessiner via Items.Refresh() (PSCustomObject n'implémente
+# pas INotifyPropertyChanged, le binding TwoWay ne déclenche donc pas le redraw seul).
+function Toggle-SelectAll {
+    param(
+        [Parameter(Mandatory)] $Collection,
+        [Parameter(Mandatory)] $Grid
+    )
+    $items = @($Collection)
+    if ($items.Count -eq 0) { return }
+    $allSelected = ($items | Where-Object { -not $_.Selected }).Count -eq 0
+    foreach ($it in $items) { $it.Selected = -not $allSelected }
+    try { $Grid.Items.Refresh() } catch {}
+}
+
+$ctrl.BtnWingetSelectAll.Add_Click({    Toggle-SelectAll -Collection $sync.WingetUpgrades  -Grid $ctrl.WingetGrid })
+$ctrl.BtnInstalledSelectAll.Add_Click({ Toggle-SelectAll -Collection $sync.WingetInstalled -Grid $ctrl.InstalledGrid })
+$ctrl.BtnBloatSelectAll.Add_Click({     Toggle-SelectAll -Collection $sync.BloatList       -Grid $ctrl.BloatGrid })
+$ctrl.BtnDriversSelectAll.Add_Click({   Toggle-SelectAll -Collection $sync.DriverUpdates   -Grid $ctrl.DriversGrid })
+$ctrl.BtnStartupSelectAll.Add_Click({   Toggle-SelectAll -Collection $sync.StartupItems    -Grid $ctrl.StartupGrid })
+$ctrl.BtnServicesSelectAll.Add_Click({  Toggle-SelectAll -Collection $sync.ServicesItems   -Grid $ctrl.ServicesGrid })
+$ctrl.BtnProcessSelectAll.Add_Click({   Toggle-SelectAll -Collection $sync.ProcessesItems  -Grid $ctrl.ProcessesGrid })
 
 # --- Bindings v2 (nouvelles fonctionnalités) ---
 
@@ -3940,5 +4312,34 @@ $window.Add_Closed({
     } catch {}
 })
 
-[void]$window.ShowDialog()
+try {
+    [void]$window.ShowDialog()
+} catch {
+    try { [System.Windows.MessageBox]::Show("Erreur fatale au démarrage :`r`n`r`n$($_.Exception.Message)`r`n`r`n$($_.Exception.StackTrace)", "Titalium", "OK", "Error") | Out-Null } catch {}
+} finally {
+    # Cleanup explicite — évite les processus orphelins (parent zombie sans fenêtre,
+    # ou enfants sfc/dism/net qui survivent au parent).
+    try { if ($sync.RenderTimer) { $sync.RenderTimer.Stop() } } catch {}
+    try { if ($sync.UITimer) { $sync.UITimer.Stop() } } catch {}
+    # Tue le process enfant courant + tous les PIDs trackés encore vivants.
+    # Note : le Job Object Windows tuera de toute façon les enfants au moment où
+    # ce process meurt, mais on fait le cleanup explicite pour être propre.
+    try {
+        if ($sync.SpawnedPids) {
+            foreach ($spid in @($sync.SpawnedPids.Keys)) {
+                try {
+                    if (Get-Process -Id $spid -EA SilentlyContinue) {
+                        $tk = [System.Diagnostics.Process]::Start('taskkill.exe', "/T /F /PID $spid")
+                        if ($tk) { $tk.WaitForExit(1000) | Out-Null }
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+    try { if ($sync.Runspace) { $sync.Runspace.Close() } } catch {}
+    # Force-exit : termine tous les threads (foreground + background) ET ferme le
+    # handle du Job Object → KILL_ON_JOB_CLOSE déclenche le kill cascade côté kernel
+    # de tous les enfants assignés. Plus aucun orphelin possible.
+    [Environment]::Exit(0)
+}
 #endregion
