@@ -1,0 +1,23 @@
+{
+  "version": "1.1.0",
+  "released": "2026-05-09",
+  "name": "Titalium Repair Tool",
+  "author": "Titalium",
+  "homepage": "https://titalium.fr",
+  "repository": "https://github.com/titalium/TitaliumRepair",
+  "downloadUrl": "https://github.com/titalium/TitaliumRepair/releases/latest/download/TitaliumRepair.exe",
+  "license": "Apache-2.0",
+  "minWindowsVersion": "10.0.18363",
+  "requiresAdmin": true,
+  "changelog": [
+    "Tableau de bord avec détection antivirus tiers (SecurityCenter2)",
+    "Bandeau de progression global avec pourcentage en temps réel (parse SFC/DISM)",
+    "Lien Titalium cliquable dans le footer (https://titalium.fr)",
+    "Logiciels installés : DataGrid avec filtre + désinstallation sélective",
+    "Pilotes : recherche des MAJ via Windows Update + installation sélective",
+    "Performances : DataGrids interactifs (démarrage / services / processus) avec actions de groupe",
+    "Vérification automatique de mise à jour via API GitHub Releases",
+    "10 nouvelles fonctionnalités : bloatware, WiFi, caches navigateurs, hibernation, file impression, télémétrie, BSOD, mode performances visuelles, profils de maintenance, God Mode",
+    "Refactor du marshalling UI : ConcurrentQueue + DispatcherTimer (corrige le bug cross-thread WPF + PowerShell)"
+  ]
+}
