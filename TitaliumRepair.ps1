@@ -11,11 +11,18 @@ $script:GitHubRepo = 'titalium/TitaliumRepair'
 #region Auto-élévation
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
     try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -ErrorAction Stop | Out-Null
+        if ($PSCommandPath) {
+            # Mode .ps1 : relance powershell.exe avec -File
+            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -ErrorAction Stop | Out-Null
+        } else {
+            # Mode .exe (ps2exe) : relance le .exe lui-même
+            $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            Start-Process -FilePath $exe -Verb RunAs -ErrorAction Stop | Out-Null
+        }
     } catch {
-        [System.Windows.Forms.MessageBox]::Show('Élévation refusée. Le programme nécessite les droits administrateur.', 'Titalium', 'OK', 'Error') | Out-Null
+        try { [System.Windows.Forms.MessageBox]::Show('Élévation refusée. Le programme nécessite les droits administrateur.', 'Titalium', 'OK', 'Error') | Out-Null } catch {}
     }
     exit
 }
@@ -34,7 +41,16 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 $sync = [hashtable]::Synchronized(@{})
 $sync.Busy = $false
 $sync.CancelRequested = $false
-$sync.AppRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$sync.AppRoot = if ($PSScriptRoot) {
+    $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path) {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    # En mode .exe (ps2exe), ni $PSScriptRoot ni $MyInvocation.MyCommand.Path ne sont peuplés.
+    # On retombe sur le chemin du processus en cours (= le .exe lui-même).
+    try { Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) }
+    catch { (Get-Location).Path }
+}
 $sync.BackupDir = Join-Path $env:USERPROFILE 'Documents\TitaliumRepair\Backups'
 $sync.LogDir = Join-Path $env:USERPROFILE 'Documents\TitaliumRepair\Logs'
 $sync.WingetUpgrades = New-Object System.Collections.ObjectModel.ObservableCollection[psobject]
@@ -2249,18 +2265,31 @@ function Op-DriversSearch {
         Write-LogTitle "Recherche de mises à jour de pilotes"
         $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversClear' })
         $sync.DriverUpdatesCom = $null
+        $sync.DriverFallbackMode = $false
+
+        # Tentative 1 : Microsoft Update (inclut les drivers, contrairement à WSUS)
         try {
+            $muServiceId = '7971f918-a847-4430-9279-4a52d1efe18d'
+            $serviceManager = New-Object -ComObject Microsoft.Update.ServiceManager
+            $muRegistered = $false
+            foreach ($svc in $serviceManager.Services) {
+                if ($svc.ServiceID -eq $muServiceId) { $muRegistered = $true; break }
+            }
+            if (-not $muRegistered) {
+                Write-Log "Enregistrement du service Microsoft Update..."
+                # Flags : 7 = AllowOnlineRegistration | AllowPendingRegistration | RegisterWithAU
+                $null = $serviceManager.AddService2($muServiceId, 7, "")
+            }
             $session = New-Object -ComObject Microsoft.Update.Session
             $searcher = $session.CreateUpdateSearcher()
-            $searcher.ServerSelection = 1  # ssWindowsUpdate (par défaut Microsoft Update)
-            Write-Log "Interrogation Windows Update (cela peut prendre 1-2 minutes)..."
-            $r = $searcher.Search("IsInstalled=0 and Type='Driver' and IsHidden=0")
+            $searcher.ServerSelection = 3   # ssOthers
+            $searcher.ServiceID = $muServiceId
+            Write-Log "Interrogation Microsoft Update (cela peut prendre 1-3 minutes)..."
+            $r = $searcher.Search("IsInstalled=0 and Type='Driver'")
             $sync.DriverUpdatesCom = $r.Updates
             $count = $r.Updates.Count
-            if ($count -eq 0) {
-                Write-Log "Aucune MAJ de pilote disponible." 'OK'
-            } else {
-                Write-Log "$count MAJ de pilote(s) détectée(s) :" 'OK'
+            if ($count -gt 0) {
+                Write-Log "$count MAJ de pilote(s) détectée(s) via Microsoft Update :" 'OK'
                 for ($i = 0; $i -lt $count; $i++) {
                     $u = $r.Updates.Item($i)
                     $size = if ($u.MaxDownloadSize) { '{0:N1} Mo' -f ($u.MaxDownloadSize / 1MB) } else { '?' }
@@ -2276,17 +2305,75 @@ function Op-DriversSearch {
                     $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversAdd'; Item=$obj })
                     Write-Log "  • $($u.Title) ($size)"
                 }
+                $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversCount'; Text="$count MAJ disponibles. Coche pour installer." })
+                return
+            } else {
+                Write-Log "Aucune MAJ détectée via Microsoft Update — passage à l'inventaire local." 'WARN'
             }
-            $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversCount'; Text="$count MAJ disponibles. Coche pour installer." })
         } catch {
-            Write-Log "Erreur Windows Update : $($_.Exception.Message)" 'ERROR'
-            Write-Log "Vérifie que le service Windows Update est démarré." 'WARN'
+            $hr = '0x{0:X8}' -f $_.Exception.HResult
+            Write-Log "Microsoft Update indisponible (HRESULT $hr) : $($_.Exception.Message)" 'WARN'
+            Write-Log "Bascule sur l'inventaire local des pilotes installés..." 'WARN'
+        }
+
+        # Tentative 2 : fallback inventaire des pilotes tiers via pnputil, trié par date
+        try {
+            $sync.DriverFallbackMode = $true
+            Write-Log "Inventaire des pilotes tiers installés..."
+            $output = & pnputil.exe /enum-drivers 2>&1 | Out-String
+            $lines = $output -split "`r?`n"
+            $allDrivers = @()
+            $current = $null
+            foreach ($line in $lines) {
+                if ($line -match '^(Published Name|Nom publi[ée])\s*:\s*(.+)$') {
+                    if ($current) { $allDrivers += $current }
+                    $current = [ordered]@{ Published=$Matches[2].Trim(); Original=''; Provider=''; Class=''; Date=''; Version='' }
+                } elseif ($current) {
+                    if ($line -match '^(Original Name|Nom original|Nom de fichier d''origine)\s*:\s*(.+)$') { $current.Original = $Matches[2].Trim() }
+                    elseif ($line -match '^(Provider Name|Fournisseur)\s*:\s*(.+)$') { $current.Provider = $Matches[2].Trim() }
+                    elseif ($line -match '^(Class Name|Nom de classe|Classe)\s*:\s*(.+)$') { $current.Class = $Matches[2].Trim() }
+                    elseif ($line -match '^(Driver Date|Date du pilote)\s*:\s*(.+)$') { $current.Date = $Matches[2].Trim() }
+                    elseif ($line -match '^(Driver Version|Version du pilote)\s*:\s*(.+)$') { $current.Version = $Matches[2].Trim() }
+                }
+            }
+            if ($current) { $allDrivers += $current }
+
+            # Tri du plus ancien au plus récent (cibles probables de MAJ en haut)
+            $sorted = $allDrivers | Sort-Object {
+                try { [DateTime]::Parse($_.Date) } catch { [DateTime]::MaxValue }
+            }
+            $count = 0
+            foreach ($d in $sorted) {
+                $name = if ($d.Original) { $d.Original } else { $d.Published }
+                $title = if ($d.Provider) { "$($d.Provider) — $name (v$($d.Version))" } else { "$name (v$($d.Version))" }
+                $obj = [pscustomobject]@{
+                    Selected = $false
+                    Index = -1
+                    Title = $title
+                    Category = $d.Class
+                    Size = $d.Date
+                }
+                $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversAdd'; Item=$obj })
+                $count++
+            }
+            $sync.UIQueue.Enqueue([pscustomobject]@{ Action='DriversCount'; Text="$count pilotes tiers — triés du plus ancien au plus récent (la colonne Taille affiche la date). Microsoft Update indisponible : vérifie manuellement chez le constructeur ou via Paramètres → Windows Update." })
+            Write-Log "$count pilote(s) listé(s). Les plus anciens (potentiels candidats à MAJ) sont en haut." 'OK'
+            Write-Log "Note : en mode inventaire, le bouton « Installer sélection » n'est pas opérationnel — la MAJ doit se faire via Settings ou le site du fabricant." 'WARN'
+        } catch {
+            Write-Log "Erreur d'inventaire pnputil : $($_.Exception.Message)" 'ERROR'
         }
     }
 }
 function Op-DriversInstallSel {
     Wrap-Action {
         Write-LogTitle "Installation des pilotes sélectionnés"
+        if ($sync.DriverFallbackMode) {
+            Write-Log "Mode inventaire : installation directe non disponible." 'WARN'
+            Write-Log "Pour mettre à jour ces pilotes :" 'WARN'
+            Write-Log "  • Paramètres Windows → Windows Update → Options avancées → Mises à jour facultatives → Pilotes" 'WARN'
+            Write-Log "  • OU télécharge le pilote depuis le site du fabricant (NVIDIA, Intel, AMD, Realtek...)" 'WARN'
+            return
+        }
         if (-not $sync.DriverUpdatesCom) { Write-Log "Lance d'abord la recherche." 'WARN'; return }
         $selected = @($sync.DriverUpdates | Where-Object { $_.Selected })
         if ($selected.Count -eq 0) { Write-Log "Aucune sélection." 'WARN'; return }
