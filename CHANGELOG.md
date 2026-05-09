@@ -6,6 +6,21 @@ Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le pr
 
 ---
 
+## [1.1.2] — 2026-05-09
+
+### 🐛 Corrigé
+
+- **Annulation d'opération bloquante** : `Run-Process` lisait stdout en mode synchrone caractère par caractère ; quand un processus enfant ne répondait plus (typiquement `net stop cryptsvc` quand le service Cryptographic Services est en train de stopper), le `Read()` bloquait indéfiniment et le check `$sync.CancelRequested` n'était jamais évalué — bouton « Annuler » sans effet. Lecture désormais **100 % asynchrone** via `DataReceivedEventHandler` + `BeginOutputReadLine`, et la boucle de polling vérifie cancel + exit toutes les 80 ms sans jamais bloquer.
+- **Kill complet de l'arborescence de processus** : utilise désormais `taskkill /T /F /PID <pid>` au lieu de `Process.Kill()`. C'est indispensable pour les processus parents comme `net.exe` qui lancent des descendants (`sc.exe`, `services.exe` calls) — sinon le parent est tué mais les enfants continuent à bloquer le système.
+- **Fermeture de la fenêtre quand une opération est hung** : `Window.Closing` force-kill maintenant l'arborescence de processus en cours via `taskkill /T /F`, et `Window.Closed` clôture la runspace dans un Task avec timeout 2s — plus de blocage à la fermeture, même si le processus enfant est zombie.
+
+### ✨ Ajouté
+
+- **Bouton « ✕ Arrêter »** directement dans le **bandeau de progression** (en haut, visible quand une tâche est en cours). Plus pratique et plus visible que le bouton « Annuler » du status bar (qui est toujours là en complément).
+- **Tracking du processus courant** via `$sync.CurrentProcess` — permet un kill immédiat depuis l'UI sans passer par l'introspection de l'arborescence.
+
+---
+
 ## [1.1.1] — 2026-05-09
 
 ### 🐛 Corrigé
@@ -80,6 +95,7 @@ Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le pr
 
 ---
 
+[1.1.2]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.2
 [1.1.1]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.1
 [1.1.0]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.0
 [1.0.0]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.0.0

@@ -1,5 +1,5 @@
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "released": "2026-05-09",
   "name": "Titalium Repair Tool",
   "author": "Titalium",
@@ -10,9 +10,10 @@
   "minWindowsVersion": "10.0.18363",
   "requiresAdmin": true,
   "changelog": [
-    "[FIX] Crash au démarrage du .exe : « Cannot bind argument to parameter 'Path' because it is null » — fallback robuste pour ps2exe quand $PSScriptRoot et $MyInvocation.MyCommand.Path sont vides",
-    "[FIX] Recherche de pilotes : HRESULT 0x80244011 résolu via enregistrement explicite du service Microsoft Update (au lieu de WSUS)",
-    "[FIX] Fallback inventaire pnputil trié par date quand Microsoft Update est indisponible — l'utilisateur voit ses pilotes les plus anciens en premier",
-    "[FIX] Auto-élévation : détecte le mode .ps1 vs .exe et relance la bonne cible avec UAC"
+    "[FIX] Annulation d'opération bloquante : Run-Process bloquait sur la lecture stdout quand un processus enfant ne répondait plus (ex : net stop cryptsvc). Lecture désormais 100% asynchrone via DataReceivedEventHandler — la boucle principale poll cancel + exit toutes les 80 ms et ne bloque jamais",
+    "[FIX] Kill complet de l'arborescence de processus : utilise taskkill /T /F au lieu de Process.Kill() (qui ne tue pas les descendants). Indispensable pour net.exe → sc.exe, dism qui spawn des sous-processus, etc.",
+    "[NEW] Bouton « ✕ Arrêter » dans le bandeau de progression — visible quand une tâche est en cours, plus accessible que le bouton du status bar",
+    "[NEW] Tracking du processus courant via $sync.CurrentProcess pour permettre un kill immédiat depuis l'UI",
+    "[FIX] Fermeture de la fenêtre quand une opération est hung : Window.Closing force-kill l'arborescence + Window.Closed clôture la runspace avec timeout 2s — plus de blocage à la sortie"
   ]
 }

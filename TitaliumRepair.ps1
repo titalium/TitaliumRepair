@@ -2,9 +2,9 @@
 #   TITALIUM REPAIR TOOL
 #   Réparation et optimisation Windows — Interface graphique moderne
 #   Auteur : Titalium  (https://titalium.fr)
-#   Version : 1.1.1
+#   Version : 1.1.2
 # =============================================================================
-$script:AppVersion = '1.1.1'
+$script:AppVersion = '1.1.2'
 # Repo GitHub où sont publiées les releases
 $script:GitHubRepo = 'titalium/TitaliumRepair'
 
@@ -348,6 +348,7 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="80"/>
+          <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <StackPanel Grid.Column="0">
           <Grid>
@@ -367,6 +368,9 @@ if (-not (Test-Path $sync.LogDir)) { New-Item -ItemType Directory -Force -Path $
         <TextBlock Grid.Column="1" x:Name="BannerPct" Text=""
                    Foreground="{StaticResource AccentBrush}" FontWeight="Bold" FontSize="18"
                    HorizontalAlignment="Right" VerticalAlignment="Center"/>
+        <Button Grid.Column="2" x:Name="BtnBannerStop" Content="✕  Arrêter" Width="120" Height="36"
+                Style="{StaticResource DangerButton}" Margin="20,0,0,0" VerticalAlignment="Center"
+                FontWeight="SemiBold"/>
       </Grid>
     </Border>
 
@@ -1488,26 +1492,47 @@ function Run-Process {
         $psi.CreateNoWindow = $true
         $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding(850)
         $psi.StandardErrorEncoding = [System.Text.Encoding]::GetEncoding(850)
-        $p = [System.Diagnostics.Process]::Start($psi)
-        if (-not $NoOutput) {
-            $charBuf = New-Object System.Text.StringBuilder
-            $progressRegex = [regex]'(\d{1,3}(?:[.,]\d+)?)\s*%'
-            $reader = $p.StandardOutput
-            while ($true) {
-                if ($sync.CancelRequested) {
-                    try { $p.Kill() } catch {}
-                    Write-Log "Annulé par l'utilisateur." 'WARN'
-                    return
-                }
-                $ch = $reader.Read()
-                if ($ch -lt 0) { break }
-                $c = [char]$ch
-                if ($c -eq "`n" -or $c -eq "`r") {
-                    $line = $charBuf.ToString().Trim()
-                    [void]$charBuf.Clear()
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        $p.EnableRaisingEvents = $true
+
+        # File concurrente partagée pour les lignes capturées en async (jamais bloquant)
+        $outQueue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+        $handler = [System.Diagnostics.DataReceivedEventHandler]{
+            param($s, $e)
+            if ($null -ne $e -and $null -ne $e.Data) { $outQueue.Enqueue($e.Data) }
+        }
+        $p.add_OutputDataReceived($handler)
+        $p.add_ErrorDataReceived($handler)
+
+        [void]$p.Start()
+        $sync.CurrentProcess = $p
+        $p.BeginOutputReadLine()
+        $p.BeginErrorReadLine()
+
+        $progressRegex = [regex]'(\d{1,3}(?:[.,]\d+)?)\s*%'
+        $cancelled = $false
+
+        # Boucle de polling NON-BLOQUANTE : check cancel + drain queue + sleep court
+        while (-not $p.HasExited) {
+            if ($sync.CancelRequested) {
+                $cancelled = $true
+                Write-Log "Annulation demandée — kill du processus PID $($p.Id) et de ses descendants..." 'WARN'
+                try {
+                    # taskkill /T /F : tue toute l'arborescence (net.exe → sc.exe → ...)
+                    $tk = [System.Diagnostics.Process]::Start('taskkill.exe', "/T /F /PID $($p.Id)")
+                    if ($tk) { $tk.WaitForExit(3000) | Out-Null }
+                } catch {}
+                # Belt & suspenders : kill direct si toujours vivant
+                try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+                break
+            }
+
+            if (-not $NoOutput) {
+                $line = $null
+                while ($outQueue.TryDequeue([ref]$line)) {
                     if ($line) {
                         Write-Log "  $line"
-                        # Détecte un pourcentage en sous-texte
                         $m = $progressRegex.Match($line)
                         if ($m.Success) {
                             $pct = [double]($m.Groups[1].Value -replace ',', '.')
@@ -1519,31 +1544,27 @@ function Run-Process {
                             $sync.UIQueue.Enqueue([pscustomobject]@{ Action='ProgressSubtext'; Text=$line })
                         }
                     }
-                } else {
-                    [void]$charBuf.Append($c)
-                    # Detection de % "live" sans newline (SFC affiche par exemple "Verification 12% complete..." sur la même ligne)
-                    if ($charBuf.Length -gt 4 -and $c -eq '%') {
-                        $partial = $charBuf.ToString()
-                        $m = $progressRegex.Match($partial)
-                        if ($m.Success) {
-                            $pct = [double]($m.Groups[1].Value -replace ',', '.')
-                            if ($pct -ge 0 -and $pct -le 100) {
-                                $sync.UIQueue.Enqueue([pscustomobject]@{ Action='ProgressValue'; Value=$pct })
-                            }
-                        }
-                    }
                 }
             }
-            # Flush du buffer restant
-            $tail = $charBuf.ToString().Trim()
-            if ($tail) { Write-Log "  $tail" }
-            $err = $p.StandardError.ReadToEnd()
-            if ($err -and $err.Trim()) { Write-Log "  $err" 'WARN' }
+
+            Start-Sleep -Milliseconds 80
         }
-        $p.WaitForExit()
-        return $p.ExitCode
+
+        # Drain final pour ne perdre aucune ligne
+        Start-Sleep -Milliseconds 120
+        if (-not $NoOutput) {
+            $line = $null
+            while ($outQueue.TryDequeue([ref]$line)) {
+                if ($line) { Write-Log "  $line" }
+            }
+        }
+
+        $exitCode = if ($cancelled) { -1 } else { $p.ExitCode }
+        $sync.CurrentProcess = $null
+        return $exitCode
     } catch {
         Write-Log "Erreur : $($_.Exception.Message)" 'ERROR'
+        $sync.CurrentProcess = $null
         return -1
     }
 }
@@ -3662,14 +3683,24 @@ $ctrl.BtnClearLogs.Add_Click({
     $sync.Log.Clear()
 })
 
-# Annuler
-$ctrl.BtnCancel.Add_Click({
+# Annulation (utilisée par les 2 boutons : status bar et bandeau de progression)
+$cancelHandler = {
     $sync.CancelRequested = $true
-    Write-Log "[ANNULATION] Demande d'arrêt envoyée." 'WARN'
+    try { Write-Log "[ANNULATION] Demande d'arrêt..." 'WARN' } catch {}
+    # Tue immédiatement le processus externe en cours (arborescence complète)
     try {
-        if ($sync.CurrentPS) { $sync.CurrentPS.Stop() }
+        if ($sync.CurrentProcess -and -not $sync.CurrentProcess.HasExited) {
+            $procId = $sync.CurrentProcess.Id
+            try { Write-Log "Kill du processus PID $procId et descendants (taskkill /T /F)" 'WARN' } catch {}
+            $tk = [System.Diagnostics.Process]::Start('taskkill.exe', "/T /F /PID $procId")
+            if ($tk) { $tk.WaitForExit(3000) | Out-Null }
+        }
     } catch {}
-})
+    # Stop la pipeline PowerShell elle-même
+    try { if ($sync.CurrentPS) { $sync.CurrentPS.Stop() } } catch {}
+}
+$ctrl.BtnCancel.Add_Click($cancelHandler)
+$ctrl.BtnBannerStop.Add_Click($cancelHandler)
 
 # --- Bindings v2 (nouvelles fonctionnalités) ---
 
@@ -3874,6 +3905,14 @@ $window.Add_Closing({
             $_.Cancel = $true
             return
         }
+        # Force-kill du processus enfant en cours (s'il bloque, taskkill /T /F)
+        try {
+            if ($sync.CurrentProcess -and -not $sync.CurrentProcess.HasExited) {
+                $procId = $sync.CurrentProcess.Id
+                $tk = [System.Diagnostics.Process]::Start('taskkill.exe', "/T /F /PID $procId")
+                if ($tk) { $tk.WaitForExit(2000) | Out-Null }
+            }
+        } catch {}
         try { if ($sync.CurrentPS) { $sync.CurrentPS.Stop() } } catch {}
     }
 })
@@ -3881,8 +3920,23 @@ $window.Add_Closing({
 $window.Add_Closed({
     try { if ($sync.RenderTimer) { $sync.RenderTimer.Stop() } } catch {}
     try { if ($sync.UITimer) { $sync.UITimer.Stop() } } catch {}
+    # Force-kill du dernier processus enfant si toujours vivant (ceinture + bretelles avec Add_Closing)
     try {
-        if ($sync.Runspace) { $sync.Runspace.Close(); $sync.Runspace.Dispose() }
+        if ($sync.CurrentProcess -and -not $sync.CurrentProcess.HasExited) {
+            $procId = $sync.CurrentProcess.Id
+            $tk = [System.Diagnostics.Process]::Start('taskkill.exe', "/T /F /PID $procId")
+            if ($tk) { $tk.WaitForExit(1500) | Out-Null }
+        }
+    } catch {}
+    # Dispose de la runspace avec timeout : si elle est hung, on n'attend pas (le process exit la nettoiera)
+    try {
+        if ($sync.Runspace) {
+            $closeTask = [System.Threading.Tasks.Task]::Run([System.Action]{
+                try { $sync.Runspace.Close() } catch {}
+                try { $sync.Runspace.Dispose() } catch {}
+            })
+            [void]$closeTask.Wait(2000)
+        }
     } catch {}
 })
 
