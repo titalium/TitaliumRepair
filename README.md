@@ -4,7 +4,7 @@
 
 **Couteau-suisse de réparation et d'optimisation Windows, taillé pour les techniciens et les power-users.**
 
-[![Version](https://img.shields.io/badge/version-1.1.0-00D9FF?style=flat-square)](https://github.com/titalium/TitaliumRepair/releases)
+[![Version](https://img.shields.io/badge/version-1.1.1-00D9FF?style=flat-square)](https://github.com/titalium/TitaliumRepair/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey?style=flat-square)](#)
 [![Made by](https://img.shields.io/badge/made%20by-Titalium-00D9FF?style=flat-square)](https://titalium.fr)

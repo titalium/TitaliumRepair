@@ -6,7 +6,21 @@ Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le pr
 
 ---
 
+## [1.1.1] — 2026-05-09
+
+### 🐛 Corrigé
+
+- **Crash au démarrage du `.exe`** : `« Cannot bind argument to parameter 'Path' because it is null »`. En mode ps2exe, ni `$PSScriptRoot` ni `$MyInvocation.MyCommand.Path` ne sont peuplés. Fallback désormais robuste sur `[System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName`.
+- **Recherche de pilotes** : `HRESULT 0x80244011` (`WU_E_PT_REGISTRATION_NOT_SUPPORTED`) sur les postes hors domaine ou avec WSUS mal configuré. On enregistre désormais explicitement le service Microsoft Update (GUID `7971f918-a847-4430-9279-4a52d1efe18d`) et on cherche via `ServerSelection=3 + ServiceID`.
+- **Fallback inventaire pilotes** : si Microsoft Update reste inaccessible, l'app bascule automatiquement sur l'inventaire `pnputil /enum-drivers`, **trié par date** (les plus anciens en haut, candidats probables à une mise à jour). L'utilisateur voit ses pilotes obsolètes et peut les mettre à jour manuellement via Settings ou le site du fabricant.
+- **Auto-élévation** : détecte désormais le mode `.ps1` vs `.exe` et relance la bonne cible avec UAC (le mode `.ps1` relance `powershell.exe -File`, le mode `.exe` se relance lui-même via le path du processus courant).
+
+---
+
 ## [1.1.0] — 2026-05-09
+
+> ⚠️ Cette release contient un bug critique au démarrage du `.exe`. **Utilisez la v1.1.1 ou supérieure.**
+
 
 ### ✨ Ajouté
 
@@ -66,5 +80,6 @@ Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le pr
 
 ---
 
+[1.1.1]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.1
 [1.1.0]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.0
 [1.0.0]: https://github.com/titalium/TitaliumRepair/releases/tag/v1.0.0

@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "released": "2026-05-09",
   "name": "Titalium Repair Tool",
   "author": "Titalium",
@@ -10,14 +10,9 @@
   "minWindowsVersion": "10.0.18363",
   "requiresAdmin": true,
   "changelog": [
-    "Tableau de bord avec détection antivirus tiers (SecurityCenter2)",
-    "Bandeau de progression global avec pourcentage en temps réel (parse SFC/DISM)",
-    "Lien Titalium cliquable dans le footer (https://titalium.fr)",
-    "Logiciels installés : DataGrid avec filtre + désinstallation sélective",
-    "Pilotes : recherche des MAJ via Windows Update + installation sélective",
-    "Performances : DataGrids interactifs (démarrage / services / processus) avec actions de groupe",
-    "Vérification automatique de mise à jour via API GitHub Releases",
-    "10 nouvelles fonctionnalités : bloatware, WiFi, caches navigateurs, hibernation, file impression, télémétrie, BSOD, mode performances visuelles, profils de maintenance, God Mode",
-    "Refactor du marshalling UI : ConcurrentQueue + DispatcherTimer (corrige le bug cross-thread WPF + PowerShell)"
+    "[FIX] Crash au démarrage du .exe : « Cannot bind argument to parameter 'Path' because it is null » — fallback robuste pour ps2exe quand $PSScriptRoot et $MyInvocation.MyCommand.Path sont vides",
+    "[FIX] Recherche de pilotes : HRESULT 0x80244011 résolu via enregistrement explicite du service Microsoft Update (au lieu de WSUS)",
+    "[FIX] Fallback inventaire pnputil trié par date quand Microsoft Update est indisponible — l'utilisateur voit ses pilotes les plus anciens en premier",
+    "[FIX] Auto-élévation : détecte le mode .ps1 vs .exe et relance la bonne cible avec UAC"
   ]
 }

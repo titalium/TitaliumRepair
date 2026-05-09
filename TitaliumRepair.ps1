@@ -2,9 +2,9 @@
 #   TITALIUM REPAIR TOOL
 #   Réparation et optimisation Windows — Interface graphique moderne
 #   Auteur : Titalium  (https://titalium.fr)
-#   Version : 1.1.0
+#   Version : 1.1.1
 # =============================================================================
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.1.1'
 # Repo GitHub où sont publiées les releases
 $script:GitHubRepo = 'titalium/TitaliumRepair'
 
