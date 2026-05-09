@@ -3,6 +3,10 @@ TitaliumRepair.exe
 *.exe.config
 *.pdb
 
+# Outils locaux (nuget.exe portable, etc.) et packages générés
+.tools/
+*.nupkg
+
 # Icône optionnelle générée localement
 TitaliumRepair.ico
 

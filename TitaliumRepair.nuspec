@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>TitaliumRepair</id>
+    <version>1.1.2</version>
+    <title>Titalium Repair Tool</title>
+    <authors>Titalium</authors>
+    <owners>Titalium</owners>
+    <projectUrl>https://github.com/titalium/TitaliumRepair</projectUrl>
+    <repository type="git" url="https://github.com/titalium/TitaliumRepair.git" branch="main" />
+    <license type="expression">Apache-2.0</license>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <readme>README.md</readme>
+    <description>Couteau-suisse de réparation et d'optimisation Windows. Interface WPF moderne, 80+ outils (SFC, DISM, winget, registre, pilotes, bloatware, BSOD, télémétrie, etc.) en un seul .exe portable.</description>
+    <summary>Outil portable de réparation Windows avec UI WPF moderne.</summary>
+    <releaseNotes>https://github.com/titalium/TitaliumRepair/releases/tag/v1.1.2</releaseNotes>
+    <copyright>Copyright (c) 2026 Titalium — Apache-2.0</copyright>
+    <tags>windows windows-10 windows-11 repair sysadmin powershell wpf sfc dism winget portable system-cleaner registry-cleaner bloatware-removal driver-updater</tags>
+  </metadata>
+  <files>
+    <file src="TitaliumRepair.exe" target="tools\TitaliumRepair.exe" />
+    <file src="version.json" target="tools\version.json" />
+    <file src="README.md" target="README.md" />
+    <file src="CHANGELOG.md" target="CHANGELOG.md" />
+    <file src="LICENSE" target="LICENSE.txt" />
+  </files>
+</package>
