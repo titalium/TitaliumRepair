@@ -1,0 +1,19 @@
+# Build artefacts (publiés en assets de release, pas en git)
+TitaliumRepair.exe
+*.exe.config
+*.pdb
+
+# Icône optionnelle générée localement
+TitaliumRepair.ico
+
+# OS / éditeurs
+Thumbs.db
+desktop.ini
+.DS_Store
+.vs/
+.vscode/
+*.swp
+*.bak
+
+# PowerShell artefacts
+*.psm1.bak
